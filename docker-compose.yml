@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  catalogue-images:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      APP_USERNAME: "admin"            # à changer
+      APP_PASSWORD: "simah"        # à changer
+      # Liste de clés SerpAPI préconfigurées (facultatif)
+      # Format: "cle1,cle2,cle3"
+      SERPAPI_KEYS: "15ff7591eb56c2f2b5f4088312ca2c87a4aea6400877cefa22feaeed60cf2447ta_cle_serpapi_2"
+    volumes:
+      # Cache persistant sur l'hôte
+      - ./image_cache.json:/app/image_cache.json
+
