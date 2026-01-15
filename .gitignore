@@ -1,0 +1,15 @@
+# Environnement Python
+venv/
+__pycache__/
+*.pyc
+
+# Secrets & config
+.env
+image_cache.json
+
+# Fichiers générés
+*.xlsx
+*.log
+
+# OS
+.DS_Store
