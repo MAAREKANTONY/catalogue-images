@@ -4,6 +4,8 @@ import time
 import json
 import random
 import logging
+import zipfile
+import xml.etree.ElementTree as ET
 import requests
 import pandas as pd
 import streamlit as st
@@ -54,45 +56,199 @@ def extract_original_photo_spans(
     """Extrait les images d'une *colonne* du fichier Excel source et retourne :
     - spans: liste de tuples (start_df_idx, end_df_idx, img_bytes)
       où l'image doit être insérée uniquement sur start_df_idx puis la cellule est mergée jusqu'à end_df_idx.
-    Limitations : nécessite que les images soient ancrées dans la feuille (cas Excel classique).
+
+    Supporte 2 cas :
+    1) Images "classiques" (drawing) : ws._images (openpyxl)
+    2) Images "dans les cellules" (Excel 365 / Rich Data) : via xl/richData + attribut vm=""
+
+    Le mapping des lignes respecte les cellules fusionnées : si la colonne photo est fusionnée sur plusieurs lignes,
+    l'image est appliquée au groupe (insertion sur la 1ère ligne + merge vertical).
     """
     if photo_column_name not in df_columns:
         return []
 
-    # Pandas: header = première ligne après skiprows
-    header_row = int(rows_to_skip_top) + 1  # 1-based row number in Excel
-    data_start_row = header_row + 1         # 1-based
+    try:
+        import openpyxl
+    except Exception:
+        return []
 
-    # colonne Excel (1-based) correspondant à photo_column_name
-    col_pos_0 = list(df_columns).index(photo_column_name)
-    photo_col_excel = col_pos_0 + 1
-
-    wb = load_workbook(io.BytesIO(excel_bytes))
+    wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
     ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+
+    # Pandas: header = première ligne après skiprows
+    header_row = rows_to_skip_top + 1          # 1-based
+    data_start_row = header_row + 1            # 1-based (première ligne de données)
+
+    # index de colonne (1-based) selon l'ordre des colonnes pandas
+    try:
+        col_idx = list(df_columns).index(photo_column_name) + 1
+    except Exception:
+        return []
+
+    col_letter = get_column_letter(col_idx)
 
     # helper: find merged range containing a cell
     def merged_span_for_cell(r: int, c: int):
-        # r,c are 1-based
         for mr in ws.merged_cells.ranges:
             if mr.min_row <= r <= mr.max_row and mr.min_col <= c <= mr.max_col:
                 return mr.min_row, mr.max_row
         return r, r
 
     spans = []
-    images = getattr(ws, "_images", [])
-    for img in images:
-        try:
-            anchor = img.anchor
-            # openpyxl image anchor usually has ._from with 0-based indexes
-            frm = getattr(anchor, "_from", None) or getattr(anchor, "from_", None)
-            if frm is None:
-                continue
-            img_col = int(getattr(frm, "col", -1)) + 1  # to 1-based
-            img_row = int(getattr(frm, "row", -1)) + 1  # to 1-based
-            if img_col != photo_col_excel:
+
+    # --- Cas 1 : images ancrées (ws._images) ---
+    images = getattr(ws, "_images", []) or []
+    if images:
+        for img in images:
+            try:
+                anchor = img.anchor
+                # openpyxl anchors sometimes expose row/col as 0-based
+                if hasattr(anchor, "_from"):
+                    r = int(anchor._from.row) + 1
+                    c = int(anchor._from.col) + 1
+                elif hasattr(anchor, "row") and hasattr(anchor, "col"):
+                    r = int(anchor.row) + 1
+                    c = int(anchor.col) + 1
+                else:
+                    continue
+
+                if c != col_idx:
+                    continue
+
+                min_r, max_r = merged_span_for_cell(r, c)
+
+                start_idx = min_r - data_start_row
+                end_idx = max_r - data_start_row
+                if end_idx < 0:
+                    continue
+                if start_idx < 0:
+                    start_idx = 0
+
+                img_bytes = None
+                if hasattr(img, "_data") and callable(getattr(img, "_data")):
+                    img_bytes = img._data()
+                if not img_bytes:
+                    continue
+
+                spans.append((start_idx, end_idx, img_bytes))
+            except Exception:
                 continue
 
-            min_r, max_r = merged_span_for_cell(img_row, img_col)
+        return spans
+
+    # --- Cas 2 : images "Rich Data" (Excel 365 : images dans les cellules) ---
+    # On parse le xlsx (zip) pour récupérer les images référencées via vm="" dans la feuille.
+    try:
+        import zipfile
+        import xml.etree.ElementTree as ET
+        zf = zipfile.ZipFile(io.BytesIO(excel_bytes))
+
+        # 1) déterminer le fichier sheetN.xml correspondant à ws
+        try:
+            sheet_idx = wb.sheetnames.index(ws.title) + 1
+        except Exception:
+            sheet_idx = 1
+        sheet_xml_path = f"xl/worksheets/sheet{sheet_idx}.xml"
+        if sheet_xml_path not in zf.namelist():
+            return []
+
+        sheet_xml = zf.read(sheet_xml_path)
+
+        # 2) récupérer les cellules de la colonne voulue qui ont vm=""
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        root = ET.fromstring(sheet_xml)
+
+        vm_cells = []  # (excel_row, vm_index)
+        for c_el in root.findall(".//m:c", ns):
+            addr = c_el.attrib.get("r")
+            vm = c_el.attrib.get("vm")
+            if not addr or vm is None:
+                continue
+            # addr like "B2"
+            if not addr.startswith(col_letter):
+                continue
+            # extract row number
+            try:
+                excel_row = int("".join(ch for ch in addr if ch.isdigit()))
+                vm_index = int(vm)
+            except Exception:
+                continue
+            vm_cells.append((excel_row, vm_index))
+
+        if not vm_cells:
+            return []
+
+        # 3) parser rich values : vm_index (1-based) -> rel_index (0-based) -> rId -> media path
+        # rich value data
+        rv_path = "xl/richData/rdrichvalue.xml"
+        rel_list_path = "xl/richData/richValueRel.xml"
+        rels_path = "xl/richData/_rels/richValueRel.xml.rels"
+        if rv_path not in zf.namelist() or rel_list_path not in zf.namelist() or rels_path not in zf.namelist():
+            return []
+
+        rv_root = ET.fromstring(zf.read(rv_path))
+        rv_ns = {"r": "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"}
+        rv_elems = rv_root.findall(".//r:rv", rv_ns)
+
+        # each rv has <v>...</v> values; first v is usually image rel index
+        rv_to_rel_index = []
+        for rv_el in rv_elems:
+            vals = [v.text for v in rv_el.findall("r:v", rv_ns)]
+            if not vals:
+                rv_to_rel_index.append(None)
+                continue
+            try:
+                rv_to_rel_index.append(int(vals[0]))
+            except Exception:
+                rv_to_rel_index.append(None)
+
+        rel_list_root = ET.fromstring(zf.read(rel_list_path))
+        # rel list uses same richdata namespace as rv? in practice it's in the same 2017 richdata ns
+        # but we can parse without ns by matching tag endings
+        rids = []
+        for rel_el in rel_list_root.iter():
+            if rel_el.tag.endswith("rel"):
+                rid = rel_el.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id") or rel_el.attrib.get("r:id")
+                if rid:
+                    rids.append(rid)
+
+        # rels mapping rId -> Target
+        rels_root = ET.fromstring(zf.read(rels_path))
+        rid_to_target = {}
+        for rel_el in rels_root.iter():
+            if rel_el.tag.endswith("Relationship"):
+                rid = rel_el.attrib.get("Id")
+                target = rel_el.attrib.get("Target")
+                if rid and target:
+                    # target is relative to xl/richData/
+                    # in file it's "../media/image1.png"
+                    if target.startswith("../"):
+                        target = "xl/" + target.replace("../", "")
+                    rid_to_target[rid] = target
+
+        # build spans: include merged ranges (vertical)
+        # we may have multiple vm cells for same merged group; keep first
+        seen_groups = set()
+
+        for excel_row, vm_index in vm_cells:
+            # vm_index is 1-based index into rv_to_rel_index
+            rv_pos = vm_index - 1
+            if rv_pos < 0 or rv_pos >= len(rv_to_rel_index):
+                continue
+            rel_index = rv_to_rel_index[rv_pos]
+            if rel_index is None or rel_index < 0 or rel_index >= len(rids):
+                continue
+            rid = rids[rel_index]
+            media_path = rid_to_target.get(rid)
+            if not media_path or media_path not in zf.namelist():
+                continue
+            img_bytes = zf.read(media_path)
+
+            min_r, max_r = merged_span_for_cell(excel_row, col_idx)
+            group_key = (min_r, max_r)
+            if group_key in seen_groups:
+                continue
+            seen_groups.add(group_key)
 
             start_idx = min_r - data_start_row
             end_idx = max_r - data_start_row
@@ -101,36 +257,12 @@ def extract_original_photo_spans(
             if start_idx < 0:
                 start_idx = 0
 
-            # récupérer bytes de l'image
-            img_bytes = None
-            if hasattr(img, "_data") and callable(getattr(img, "_data")):
-                img_bytes = img._data()
-            else:
-                # fallback: certains openpyxl versions ont .ref / .path
-                img_bytes = None
-
-            if not img_bytes:
-                continue
-
             spans.append((start_idx, end_idx, img_bytes))
-        except Exception:
-            continue
 
-    # dédupliquer/normaliser spans (garder le plus long si overlap)
-    spans.sort(key=lambda x: (x[0], -(x[1]-x[0])))
-    merged = []
-    for s,e,b in spans:
-        if not merged:
-            merged.append([s,e,b])
-            continue
-        ps,pe,pb = merged[-1]
-        # si même start, garder le plus long
-        if s == ps:
-            if e > pe:
-                merged[-1] = [s,e,b]
-            continue
-        merged.append([s,e,b])
-    return [(s,e,b) for s,e,b in merged]
+        return spans
+
+    except Exception:
+        return spans
 
 
 def reorder_columns_for_export(df: pd.DataFrame, first_cols: list[str]) -> pd.DataFrame:
