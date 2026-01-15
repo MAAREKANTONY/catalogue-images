@@ -472,6 +472,7 @@ def enrich_df_with_images(
     max_rows_test: int = 50,
     use_global_cache: bool = True,
     use_unique_key_cache: bool = True,
+    force_api_search: bool = False,
     unique_key_columns=None,
     debug_mode: bool = False,
     debug_logs: list | None = None,
@@ -508,6 +509,8 @@ def enrich_df_with_images(
             df[col] = None
 
     # Chargement du cache global
+    # NB: si force_api_search=True, on ignore les *hits* du cache, mais on peut
+    # quand même charger/sauver le fichier pour mettre à jour les entrées.
     global_cache = load_cache() if use_global_cache else {}
     # Cache clé unique : clé composite -> liste d'URLs
     unique_cache = {} if use_unique_key_cache and unique_key_columns else {}
@@ -545,8 +548,9 @@ def enrich_df_with_images(
                 _dbg("Unique-key cache hit", {"row": row_index, "unique_key": list(unique_key) if isinstance(unique_key, tuple) else unique_key})
 
             else:
-                # 2) Cache global texte -> URLs
-                if use_global_cache and query in global_cache:
+                # 2) Cache global texte -> URLs (optionnel)
+                # Si force_api_search=True, on ignore le cache même si une entrée existe.
+                if (not force_api_search) and use_global_cache and query in global_cache:
                     urls = global_cache[query]
                     source = "global_cache"
                     _dbg("Global cache hit", {"row": row_index, "query": query})
@@ -574,7 +578,7 @@ def enrich_df_with_images(
                                 serpapi_key=serpapi_key,
                                 max_results=max_images,
                             )
-                        source = "serpapi"
+                        source = "serpapi" if not force_api_search else "serpapi_forced"
                         if use_global_cache:
                             global_cache[query] = urls
                         if not test_mode:
@@ -1030,6 +1034,16 @@ def app_main():
 
     st.header("4. Options de cache")
 
+    force_api_search = st.checkbox(
+        "Forcer la recherche via l’API (ignorer le cache existant)",
+        value=False,
+        help=(
+            "Quand cette option est activée, l’application ne réutilise pas les résultats déjà présents dans "
+            "le cache global (image_cache.json). Elle appelle SerpAPI même si une entrée de cache existe, "
+            "et met ensuite à jour le cache avec les nouveaux résultats."
+        ),
+    )
+
     use_global_cache = st.checkbox(
         "Activer le cache global (texte de requête -> images) [fichier image_cache.json]",
         value=True,
@@ -1125,6 +1139,7 @@ def app_main():
                 max_rows_test=max_rows_test,
                 use_global_cache=use_global_cache,
                 use_unique_key_cache=use_unique_key_cache,
+                force_api_search=force_api_search,
                 unique_key_columns=unique_key_columns,
                 debug_mode=debug_mode,
                 debug_logs=[],
